@@ -1588,7 +1588,15 @@ export const make = (
           extendEnv: options.spawn.extendEnv ?? true,
           ...(options.ownDetachedProcessGroup === undefined
             ? {}
-            : { detached: options.ownDetachedProcessGroup }),
+            : {
+                // A detached cmd.exe shell severs the child's stdio pipes
+                // on Windows, hanging ACP sessions whose command is a
+                // .cmd/.bat shim. Ownership (taskkill tree termination)
+                // still applies; only the detach flag is dropped for shell
+                // spawns, which exist solely on Windows.
+                detached:
+                  options.ownDetachedProcessGroup === true && containedSpawnCommand.shell !== true,
+              }),
           shell: containedSpawnCommand.shell,
         }),
       )

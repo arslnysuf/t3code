@@ -56,6 +56,14 @@ Opening a provider session can start MCP servers, run hooks, or launch a login b
 session creation for this reason. Antigravity likewise reserves authenticated catalog sessions for
 explicit setup or model refresh; background checks use initialization only.
 
+[Muse probes](../../apps/server/src/provider/Layers/MuseProvider.ts) are the narrow exception:
+`muse-acp` exposes models and reasoning tiers only through a live session's
+`configOptions`, so discovery opens a disposable session. It stays side-effect
+free by authenticating nothing (`authenticateOnAuthRequired: false`), attaching
+no MCP servers, and never sending a prompt; Muse does not persist pre-turn
+sessions, and scope exit kills the host. A failed or slow discovery degrades to
+the fallback model instead of failing the provider.
+
 [Antigravity sign-in](../../apps/server/src/provider/AntigravityAuth.ts) belongs to the initiating
 T3 auth session. The client carries the return URL back to the environment because the provider's
 loopback listener may be on another machine. Forward only the callback for the owned pending flow;

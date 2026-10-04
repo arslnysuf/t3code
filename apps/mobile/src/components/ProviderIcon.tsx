@@ -142,6 +142,25 @@ export function ProviderIcon(props: ProviderIconProps) {
     );
   }
 
+  // Muse has no brand glyph yet; a neutral monogram keeps it distinct from
+  // the codex fallback below instead of impersonating another provider.
+  if (props.provider === "muse") {
+    return (
+      <View style={{ width: size, height: size, alignItems: "center", justifyContent: "center" }}>
+        <Text
+          style={{
+            fontSize: size * 0.62,
+            fontWeight: "700",
+            lineHeight: size * 0.75,
+            color: mono,
+          }}
+        >
+          M
+        </Text>
+      </View>
+    );
+  }
+
   // codex (and unknown drivers)
   return (
     <Svg width={size} height={size} viewBox="100 100 411 411" fill="none">
