@@ -140,6 +140,52 @@ interface AcpOutgoingWriterState {
 const decodeSessionUpdate = Schema.decodeUnknownEffect(
   Schema.Union([AcpSchema.UpdateSessionNotification, AcpSchemaV1.SessionNotification]),
 );
+
+type DecodedSessionUpdateNotification =
+  | AcpSchema.UpdateSessionNotification
+  | AcpSchemaV1.SessionNotification;
+
+/** Translated kind for the single-option config patches below. */
+const SINGULAR_CONFIG_OPTION_UPDATE_KIND = "_t3_singular_config_option_update";
+
+const isUnknownRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * muse-acp 0.9.x broadcasts single-option patches as
+ * `{sessionUpdate: "config_option_update", configId, currentValue}` without
+ * the spec's full `configOptions` array. Decoding that strictly fails the
+ * whole connection, so translate the patch into an unknown-kind update: the
+ * session-update transform maps it onto the existing unknown-update path,
+ * session state is left untouched, and the payload stays on the notification
+ * for debugging. Full-array broadcasts still decode through the schema.
+ */
+function singularConfigOptionUpdateParams(
+  payload: unknown,
+): DecodedSessionUpdateNotification | undefined {
+  if (!isUnknownRecord(payload) || typeof payload.sessionId !== "string") return undefined;
+  const update = payload.update;
+  if (!isUnknownRecord(update) || update.sessionUpdate !== "config_option_update") {
+    return undefined;
+  }
+  if (Array.isArray(update.configOptions)) return undefined;
+  const configId = typeof update.configId === "string" ? update.configId : undefined;
+  const currentValue = update.currentValue;
+  return {
+    sessionId: payload.sessionId,
+    update: {
+      sessionUpdate: SINGULAR_CONFIG_OPTION_UPDATE_KIND,
+      ...(configId === undefined ? {} : { configId }),
+      ...(typeof currentValue === "string" || typeof currentValue === "boolean"
+        ? { currentValue }
+        : {}),
+      ...(isUnknownRecord(update._meta) ? { _meta: update._meta } : {}),
+    },
+    ...(isUnknownRecord(payload._meta) ? { _meta: payload._meta } : {}),
+    // The translated kind intentionally sits outside the spec union; the
+    // session-update transform maps it onto the existing unknown-update path.
+  } as unknown as DecodedSessionUpdateNotification;
+}
 const decodeElicitationComplete = Schema.decodeUnknownEffect(
   AcpSchema.CompleteElicitationNotification,
 );
@@ -472,7 +518,12 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const handleRequestEncoded = (message: RpcMessage.RequestEncoded) => {
     if (message.id === "") {
       if (message.tag === CLIENT_METHODS.session_update) {
-        return decodeSessionUpdate(message.payload).pipe(
+        const translated = singularConfigOptionUpdateParams(message.payload);
+        return (
+          translated === undefined
+            ? decodeSessionUpdate(message.payload)
+            : Effect.succeed(translated)
+        ).pipe(
           Effect.map(
             (params) =>
               ({

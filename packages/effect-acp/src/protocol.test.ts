@@ -147,6 +147,81 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       }),
   );
 
+  it.effect(
+    "translates singular config_option_update patches instead of failing the connection",
+    () =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+        });
+
+        const notifications =
+          yield* Deferred.make<ReadonlyArray<AcpProtocol.AcpIncomingNotification>>();
+        yield* transport.incoming.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.flatMap((notificationChunk) => Deferred.succeed(notifications, notificationChunk)),
+          Effect.forkScoped,
+        );
+
+        // Exact muse-acp 0.9.x shape: a single-option patch without `configOptions`.
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString({
+              jsonrpc: "2.0",
+              method: "session/update",
+              params: {
+                sessionId: "session-1",
+                update: {
+                  sessionUpdate: "config_option_update",
+                  configId: "reasoning_effort",
+                  currentValue: "max",
+                },
+              },
+            })}\n`,
+          ),
+        );
+
+        // A second, valid notification proves the connection survived the patch.
+        yield* Queue.offer(
+          input,
+          yield* encodeJsonl(SessionUpdateNotification, {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: "session-1",
+              update: {
+                sessionUpdate: "plan",
+                entries: [
+                  {
+                    content: "Inspect repository",
+                    priority: "high",
+                    status: "in_progress",
+                  },
+                ],
+              },
+            },
+          }),
+        );
+
+        const [patch, followUp] = yield* Deferred.await(notifications);
+        assert.equal(patch?._tag, "SessionUpdate");
+        assert.equal(followUp?._tag, "SessionUpdate");
+        if (patch?._tag !== "SessionUpdate") throw new Error("expected SessionUpdate");
+        const update = patch.params.update as {
+          readonly sessionUpdate: string;
+          readonly configId?: unknown;
+          readonly currentValue?: unknown;
+        };
+        assert.equal(update.sessionUpdate, "_t3_singular_config_option_update");
+        assert.equal(update.configId, "reasoning_effort");
+        assert.equal(update.currentValue, "max");
+      }),
+  );
+
   it.effect("keeps only recent raw notifications after their callbacks run", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();
