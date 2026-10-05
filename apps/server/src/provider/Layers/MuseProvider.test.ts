@@ -2,9 +2,15 @@
 import { describe, expect, it } from "@effect/vitest";
 import { MuseSettings } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import { ChildProcessSpawner } from "effect/process";
+import { TestClock } from "effect/testing";
 
 import { acpProviderOptionDescriptors } from "../acp/AcpSessionConfig.ts";
 import {
@@ -197,6 +203,52 @@ const museCliSource = [
   "process.exit(1);",
   "",
 ].join("\n");
+
+/** Fake `muse` whose `--version` exits non-zero. */
+const museCliExitCodeSource = (code: number) =>
+  [
+    'if (process.argv[2] === "--version") {',
+    `  process.exit(${code});`,
+    "}",
+    "process.exit(1);",
+    "",
+  ].join("\n");
+
+/**
+ * Fake spawner for the Muse CLI timeout test: `muse-acp --version` answers at
+ * once while `muse --version` hangs forever, so the probe timeout fires. A
+ * real hanging subprocess cannot be used here because the orphaned grandchild
+ * keeps the stdio pipes open past the kill, stalling scope teardown.
+ */
+const makeMuseCliHangSpawner = () => {
+  const makeHandle = (input: {
+    readonly stdout: Stream.Stream<Uint8Array>;
+    readonly exitCode: Effect.Effect<ChildProcessSpawner.ExitCode>;
+  }) =>
+    ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(1),
+      exitCode: input.exitCode,
+      isRunning: Effect.succeed(false),
+      kill: () => Effect.void,
+      unref: Effect.succeed(Effect.void),
+      stdin: Sink.drain,
+      stdout: input.stdout,
+      stderr: Stream.empty,
+      all: Stream.empty,
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+    });
+  return ChildProcessSpawner.make((command) =>
+    Effect.succeed(
+      String((command as { readonly command: string }).command).includes("muse-acp")
+        ? makeHandle({
+            stdout: Stream.encodeText(Stream.make(MUSE_ACP_VERSION_OUTPUT)),
+            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          })
+        : makeHandle({ stdout: Stream.empty, exitCode: Effect.never }),
+    ),
+  );
+};
 
 const writeFakeMusePair = (sessionNewResponse: string) =>
   Effect.gen(function* () {
@@ -435,6 +487,59 @@ it.layer(NodeServices.layer)("checkMuseProviderStatus", (it) => {
       expect(snapshot.auth).toEqual({ status: "unknown" });
       expect(snapshot.models.map((model) => model.slug)).toEqual(["default"]);
       expect(snapshot.message).toContain("ACP discovery failed");
+    }),
+  );
+
+  it.effect("reports a distinct error when the Muse CLI exits non-zero", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-muse-exitcode-" });
+          const museAcpPath = writeFakeCli({
+            directory: dir,
+            name: "muse-acp",
+            source: museCliSource.replaceAll(
+              stubJson(MUSE_VERSION_OUTPUT),
+              stubJson(MUSE_ACP_VERSION_OUTPUT),
+            ),
+          });
+          const musePath = writeFakeCli({
+            directory: dir,
+            name: "muse",
+            source: museCliExitCodeSource(3),
+          });
+          return yield* checkMuseProviderStatus(
+            decodeMuseSettings({ enabled: true, binaryPath: museAcpPath }),
+            { ...process.env, MUSE_CLI: musePath },
+          );
+        }),
+      );
+      expect(snapshot.status).toBe("error");
+      expect(snapshot.installed).toBe(true);
+      expect(snapshot.version).toBe("0.9.0");
+      expect(snapshot.message).toContain("exited with code 3");
+    }),
+  );
+
+  it.effect("reports a timeout instead of an exit-code error when the Muse CLI hangs", () =>
+    Effect.gen(function* () {
+      const snapshotFiber = yield* checkMuseProviderStatus(
+        decodeMuseSettings({ enabled: true, binaryPath: "muse-acp" }),
+        { ...process.env, MUSE_CLI: "muse" },
+        50,
+      ).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, makeMuseCliHangSpawner()),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.millis(50));
+      const snapshot = yield* Fiber.join(snapshotFiber);
+      expect(snapshot.status).toBe("error");
+      expect(snapshot.installed).toBe(true);
+      expect(snapshot.version).toBe("0.9.0");
+      expect(snapshot.message).toContain("timed out");
+      expect(snapshot.message).not.toContain("exited with code");
     }),
   );
 });

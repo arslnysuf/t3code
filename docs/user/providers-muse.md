@@ -26,7 +26,7 @@ T3 Code never asks for a Meta API key.
    ```
 4. Open T3 Code Settings, enable Muse Code, and refresh the provider.
 
-`muse-acp` 0.9.0 with Muse Code 1.4.2 is the verified combination. If `muse-acp`
+`muse-acp` 0.9.0 with Muse Code 1.4.3 is the verified combination. If `muse-acp`
 is not on the server's `PATH`, set the Muse binary path to the executable
 (for example the adapter's native `muse-acp.exe`). If `muse` itself lives
 outside `PATH`, point the `MUSE_CLI` provider environment variable at it.

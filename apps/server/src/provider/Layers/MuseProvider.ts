@@ -12,8 +12,8 @@ import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
-import { HttpClient } from "effect/unstable/http";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { HttpClient } from "effect/http";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as Crypto from "effect/Crypto";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -54,7 +54,11 @@ const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
 });
 
-const VERSION_PROBE_TIMEOUT_MS = 4_000;
+// `muse --version` runs through the PowerShell launcher plus a ~450MB binary,
+// so under load it can take seconds (1.6s+ observed warm on Windows). The probe
+// gates the whole provider, so give it room instead of hard-erroring on a slow
+// machine.
+const VERSION_PROBE_TIMEOUT_MS = 15_000;
 // Discovery boots a disposable `muse serve` host, which is slow on a cold
 // start (30s+ observed on Windows), so this is generous. A miss degrades to
 // the fallback model instead of failing the provider.
@@ -223,6 +227,7 @@ const discoverMuseMetadataViaAcpSession = (
 export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(function* (
   museSettings: MuseSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  versionProbeTimeoutMs: number = VERSION_PROBE_TIMEOUT_MS,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
@@ -249,7 +254,7 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
 
   const adapterCommand = museSettings.binaryPath || MUSE_ACP_DEFAULT_COMMAND;
   const versionResult = yield* runMuseCliCommand(adapterCommand, ["--version"], environment).pipe(
-    Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
+    Effect.timeoutOption(versionProbeTimeoutMs),
     Effect.result,
   );
 
@@ -316,17 +321,14 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
 
   const museCommand = resolveMuseCliCommand(environment);
   const museResult = yield* runMuseCliCommand(museCommand, ["--version"], environment).pipe(
-    Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
+    Effect.timeoutOption(versionProbeTimeoutMs),
     Effect.result,
   );
-  if (
-    Result.isFailure(museResult) ||
-    Option.isNone(museResult.success) ||
-    museResult.success.value.code !== 0
-  ) {
-    const missing = Result.isFailure(museResult) && isCommandMissingCause(museResult.failure);
+  if (Result.isFailure(museResult)) {
+    const error = museResult.failure;
+    const missing = isCommandMissingCause(error);
     yield* Effect.logWarning("Muse CLI health check failed.", {
-      errorTag: Result.isFailure(museResult) ? museResult.failure._tag : "ExitCode",
+      errorTag: error._tag,
     });
     return buildServerProvider({
       presentation: MUSE_PRESENTATION,
@@ -341,6 +343,47 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
         message: missing
           ? "Muse Code CLI (`muse`) is not installed or not on PATH. Install Muse Code and run `muse login`."
           : "Muse Code CLI is installed but failed to run `muse --version`.",
+      },
+    });
+  }
+
+  if (Option.isNone(museResult.success)) {
+    yield* Effect.logWarning("Muse CLI health check timed out.", {
+      timeoutMs: versionProbeTimeoutMs,
+    });
+    return buildServerProvider({
+      presentation: MUSE_PRESENTATION,
+      enabled: museSettings.enabled,
+      checkedAt,
+      models: fallbackModels,
+      probe: {
+        installed: true,
+        version,
+        status: "error",
+        auth: { status: "unknown" },
+        message: "Muse Code CLI is installed but timed out while running `muse --version`.",
+      },
+    });
+  }
+
+  const museOutput = museResult.success.value;
+  if (museOutput.code !== 0) {
+    yield* Effect.logWarning("Muse CLI version probe exited with a non-zero status.", {
+      exitCode: museOutput.code,
+      stdoutLength: museOutput.stdout.length,
+      stderrLength: museOutput.stderr.length,
+    });
+    return buildServerProvider({
+      presentation: MUSE_PRESENTATION,
+      enabled: museSettings.enabled,
+      checkedAt,
+      models: fallbackModels,
+      probe: {
+        installed: true,
+        version,
+        status: "error",
+        auth: { status: "unknown" },
+        message: `Muse Code CLI is installed but \`muse --version\` exited with code ${museOutput.code}.`,
       },
     });
   }
