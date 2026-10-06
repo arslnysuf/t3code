@@ -57,6 +57,9 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import * as ServerConfig from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
+import { buildRuntimeInstructions } from "../../provider/RuntimeInstructions.ts";
+import { t3AcpPromptWithInstructions } from "../../provider/T3OrchestrationInstructions.ts";
+import { providerMessageTextWithAttachmentPaths } from "../AttachmentPrompt.ts";
 import {
   extractXAiAcpSubagentEndNotice,
   extractXAiAcpSubagentUpdate,
@@ -1303,6 +1306,234 @@ describe("AcpAdapterV2", () => {
       );
       assert.equal(parentTools.length, 2);
       assert.equal(parentTools[0]?.title, "Parent tool finished");
+    }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
+  it.effect("suppresses a complete user_message that echoes the submitted prompt", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const path = yield* Path.Path;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      const instanceId = ProviderInstanceId.make("acp-test-user-message-echo");
+      const adapter = makeAcpAdapterV2({
+        crypto: yield* Crypto.Crypto,
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          interruptPromptOnCancel: true,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            environment: { T3_ACP_HANG_PROMPT_FOREVER: "1" },
+            wrapRuntime: (runtime) => ({
+              ...runtime,
+              handleSessionUpdate: (handler) =>
+                Effect.sync(() => {
+                  sessionUpdateHandler = handler;
+                }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+            }),
+          }),
+        },
+        fileSystem,
+        idAllocator,
+        serverConfig,
+        selfInvocation,
+      });
+      const threadId = ThreadId.make("thread-acp-user-message-echo");
+      const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-user-message-echo"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const turnFiber = yield* runtime
+        .startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+            messageText: "echo suppression probe",
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      assert.isDefined(sessionUpdateHandler, "session update handler must be wired");
+      // Rebuild the exact prompt the adapter sends (user text plus the injected
+      // runtime instructions block) so the echo below matches byte-for-byte.
+      const sentText = t3AcpPromptWithInstructions({
+        prompt: providerMessageTextWithAttachmentPaths({
+          text: "echo suppression probe",
+          attachments: [],
+          attachmentsDir: serverConfig.attachmentsDir,
+        }),
+        state: { interactionMode: "default", hasT3Mcp: false },
+      });
+      const echoText = [
+        sentText,
+        buildRuntimeInstructions({ harness: ACP_TEST_DRIVER, model: "default" }),
+      ].join("\n");
+      const userTexts: Array<string> = [];
+      // The adapter emits provider_thread.updated after installing the turn
+      // context (which carries the echo fingerprint), so feeding only after
+      // observing it cannot race context creation.
+      while (true) {
+        const event = yield* Queue.take(events);
+        if (event.type === "turn_item.updated" && event.turnItem.type === "user_message") {
+          userTexts.push(event.turnItem.text);
+        }
+        if (event.type === "provider_thread.updated") break;
+      }
+      yield* sessionUpdateHandler!({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "user_message",
+          messageId: "echo-user-message-1",
+          content: [{ type: "text", text: echoText }],
+        },
+      });
+      yield* sessionUpdateHandler!({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "user_message",
+          messageId: "novel-user-message-1",
+          content: [{ type: "text", text: "a genuinely new injected note" }],
+        },
+      });
+      const providerTurnId = idAllocator.derive.providerTurn({
+        driver: ACP_TEST_DRIVER,
+        nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
+      });
+      yield* runtime.interruptTurn({ providerThread, providerTurnId });
+      let terminalStatus: string | null = null;
+      while (terminalStatus === null) {
+        const event = yield* Queue.take(events);
+        if (event.type === "turn_item.updated" && event.turnItem.type === "user_message") {
+          userTexts.push(event.turnItem.text);
+        }
+        if (event.type === "turn.terminal" && event.providerTurnId === providerTurnId) {
+          terminalStatus = event.status;
+        }
+      }
+      yield* Fiber.join(turnFiber);
+      assert.isFalse(
+        userTexts.some((text) => text.includes("<runtime_info>")),
+        "an echoed prompt must not project the injected runtime instructions as a user message",
+      );
+      assert.isTrue(
+        userTexts.some((text) => text === "a genuinely new injected note"),
+        "a novel user_message must still project",
+      );
+    }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
+  it.effect("respawns the runtime when a policy change crosses a flavor restart boundary", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const path = yield* Path.Path;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      let runtimesSpawned = 0;
+      const instanceId = ProviderInstanceId.make("acp-test-policy-restart");
+      const adapter = makeAcpAdapterV2({
+        crypto: yield* Crypto.Crypto,
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          runtimeRestartRequiredForPolicyChange: (previous, next) =>
+            previous.runtimeMode !== "full-access" && next.runtimeMode === "full-access",
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            wrapRuntime: (runtime, runtimeOrdinal) => {
+              runtimesSpawned = Math.max(runtimesSpawned, runtimeOrdinal);
+              return runtime;
+            },
+          }),
+        },
+        fileSystem,
+        idAllocator,
+        serverConfig,
+        selfInvocation,
+      });
+      const threadId = ThreadId.make("thread-acp-policy-restart");
+      const policyFor = (runtimeMode: "auto" | "full-access") =>
+        ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode,
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-policy-restart"),
+        modelSelection,
+        runtimePolicy: policyFor("auto"),
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy: policyFor("auto"),
+      });
+      const runTurn = (ordinal: number, runtimeMode: "auto" | "full-access") =>
+        Effect.gen(function* () {
+          const now = yield* DateTime.now;
+          yield* runtime.startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy: policyFor(runtimeMode),
+              now,
+              ordinal,
+            }),
+          );
+          const providerTurnId = idAllocator.derive.providerTurn({
+            driver: ACP_TEST_DRIVER,
+            nativeTurnId: acpScopedNativeId(instanceId, `mock-session-1:turn:${ordinal}`),
+          });
+          yield* runtime.events.pipe(
+            Stream.takeUntil(
+              (event) => event.type === "turn.terminal" && event.providerTurnId === providerTurnId,
+            ),
+            Stream.runDrain,
+          );
+        });
+      yield* runTurn(1, "auto");
+      assert.equal(runtimesSpawned, 1);
+      yield* runTurn(2, "full-access");
+      assert.equal(runtimesSpawned, 2);
     }).pipe(Effect.provide(testLayer), Effect.scoped),
   );
 

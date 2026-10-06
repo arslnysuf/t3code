@@ -58,6 +58,14 @@ it behaves as Supervised when stored. The mode can be switched on the live
 session, and the per-thread mode and reasoning selectors stay adjustable from
 the composer.
 
+Full access additionally runs the Muse host unsandboxed (the `muse serve`
+equivalent of the CLI's `--yolo` sandbox half: `--disable-sandbox
+--trust-workspace`). Sandbox posture is fixed when the host spawns, so
+switching into or out of Full Access respawns the runtime; the durable Muse
+session reloads, preserving the conversation. An explicit `MUSE_SERVE_ARGS`
+provider environment value that already sets a sandbox posture always wins
+over the automatic one.
+
 T3 Code's `delegate_task` tool can target Muse instances, and Muse threads
 receive the same `t3-code` MCP toolkit as other providers, so a Muse parent
 agent can itself delegate to Codex, Claude, or another Muse instance.

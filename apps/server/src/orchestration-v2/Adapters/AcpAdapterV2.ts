@@ -136,6 +136,12 @@ export interface AcpAdapterV2RuntimeInput {
    * so flavors that encode permissions in the launch command (Grok) read it here.
    */
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+  /**
+   * Policy in effect when this runtime spawns. Equals runtimePolicy unless the
+   * mode changed after adapter creation and a flavor restart hook respawned
+   * for it; flavors with host-lifetime posture (Muse sandbox flags) read it here.
+   */
+  readonly currentRuntimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   readonly mcpServers: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly acpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   /** Scoped credentials for terminal fallback when an ACP agent drops `mcpServers`. */
@@ -256,6 +262,16 @@ export interface AcpAdapterV2Flavor {
   readonly sessionModeForPolicy?: (
     policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
   ) => string | undefined;
+  /**
+   * Whether crossing from one runtime policy to another needs a runtime
+   * respawn because posture is fixed at spawn time (e.g. the Muse host
+   * sandbox). Flavors without host-lifetime posture omit it; approval-only
+   * switches keep reconfiguring the live session.
+   */
+  readonly runtimeRestartRequiredForPolicyChange?: (
+    previous: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+    next: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  ) => boolean;
   /**
    * Opts the session into the ACP client `fs` capability. Agents read and write
    * files themselves under their own permission model unless a flavor sets
@@ -1138,6 +1154,22 @@ interface AcpNativeBuildConfiguration {
   readonly configOptions: ReadonlyArray<{ readonly id: string; readonly value: string }>;
 }
 
+/**
+ * Display text of prompt/update content blocks, joined exactly like the
+ * session-update render path. Shared between the submitted-prompt echo
+ * fingerprint and the complete-message projection so the two can never drift.
+ */
+function acpContentBlocksDisplayText(
+  blocks: ReadonlyArray<Parameters<typeof acpContentBlockDisplayText>[0]>,
+): string {
+  return blocks
+    .flatMap((content) => {
+      const display = acpContentBlockDisplayText(content);
+      return display === undefined ? [] : [display];
+    })
+    .join("\n");
+}
+
 interface ActiveAcpTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly providerTurnId: OrchestrationV2ProviderTurn["id"];
@@ -1213,6 +1245,13 @@ interface ActiveAcpTurn {
    */
   readonly promptWireSettled: Deferred.Deferred<void, never>;
   backgroundFinalizeGeneration: number;
+  /**
+   * Joined display text of this turn's submitted prompt blocks (null when the
+   * turn sent no prompt, e.g. continuations). A complete `user_message`
+   * update matching it byte-for-byte is the agent echoing our own prompt,
+   * which startTurn already projected, so it is suppressed.
+   */
+  readonly submittedPromptEchoText: string | null;
 }
 
 type AcpRuntimeTeardownState =
@@ -2075,6 +2114,7 @@ export function makeAcpAdapterV2(
           return {
             cwd: input.runtimePolicy.cwd ?? process.cwd(),
             runtimePolicy: input.runtimePolicy,
+            currentRuntimePolicy: latestRuntimePolicy,
             mcpServers: mcpContext.servers,
             acpMcpServers: mcpContext.acpServers,
             ...(mcpContext.processEnvironment === undefined
@@ -4534,23 +4574,28 @@ export function makeAcpAdapterV2(
               }
               break;
             }
-            case "user_message":
+            case "user_message": {
+              if (update.content === undefined) break;
+              const text = acpContentBlocksDisplayText(update.content ?? []);
+              // startTurn already projects the submitted prompt. Some agents
+              // (notably muse-acp) sync the admitted prompt back as a complete
+              // user message; render only content that is actually new.
+              if (
+                context.submittedPromptEchoText !== null &&
+                text === context.submittedPromptEchoText
+              ) {
+                break;
+              }
+              yield* replaceText(context, "user", text, update.messageId);
+              break;
+            }
             case "agent_message":
             case "agent_thought": {
               if (update.content === undefined) break;
-              const text = (update.content ?? [])
-                .flatMap((content) => {
-                  const display = acpContentBlockDisplayText(content);
-                  return display === undefined ? [] : [display];
-                })
-                .join("\n");
+              const text = acpContentBlocksDisplayText(update.content ?? []);
               yield* replaceText(
                 context,
-                update.sessionUpdate === "user_message"
-                  ? "user"
-                  : update.sessionUpdate === "agent_message"
-                    ? "assistant"
-                    : "reasoning",
+                update.sessionUpdate === "agent_message" ? "assistant" : "reasoning",
                 text,
                 update.messageId,
               );
@@ -6830,7 +6875,19 @@ export function makeAcpAdapterV2(
             // Session activation can itself invoke client fs/terminal methods.
             // Install the incoming thread policy before load/resume so those
             // requests can never inherit the previously active thread's policy.
+            const previousRuntimePolicy = latestRuntimePolicy;
             latestRuntimePolicy = turnInput.runtimePolicy;
+            // Posture fixed at spawn time (e.g. the Muse host sandbox) cannot
+            // follow a mode switch on the live runtime; respawn first so this
+            // turn already runs under the newly effective policy.
+            if (
+              flavor.runtimeRestartRequiredForPolicyChange?.(
+                previousRuntimePolicy,
+                turnInput.runtimePolicy,
+              ) === true
+            ) {
+              yield* Ref.set(runtimeRestartRequired, true);
+            }
             const requestedSessionId = yield* nativeThreadId(driver, turnInput.providerThread);
             const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
               turnInput.threadId,
@@ -6916,6 +6973,8 @@ export function makeAcpAdapterV2(
             const promptParts = isContinuationTurn
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
+            const submittedPromptEchoText =
+              promptParts === null ? null : acpContentBlocksDisplayText(promptParts.prompt);
             const startedAt = yield* DateTime.now;
             const nativeTurnId = `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
             const providerTurnId = deriveProviderTurnId(nativeTurnId);
@@ -6970,6 +7029,7 @@ export function makeAcpAdapterV2(
               promptSettledStatus: null,
               promptWireSettled,
               backgroundFinalizeGeneration: 0,
+              submittedPromptEchoText,
             };
             const carryover = yield* Ref.getAndSet(carryoverSubagents, null);
             let rehydratedCarryoverSubagents: ReadonlyArray<ActiveAcpSubagent> = [];

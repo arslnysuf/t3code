@@ -20,6 +20,8 @@ import { makeAcpNativeLoggerFactory } from "../../provider/acp/AcpNativeLogging.
 import {
   makeMuseAcpRuntime,
   museApprovalModeForRuntimeMode,
+  museRuntimeRestartRequiredForPolicyChange,
+  museServeArgsForRuntimeMode,
   resolveMuseAcpBaseModelId,
 } from "../../provider/acp/MuseAcpSupport.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
@@ -90,14 +92,19 @@ function makeMuseAcpAdapterFlavor(options: MuseAdapterV2Options): AcpAdapterV2Fl
     // `reasoning_effort` apply the same way with graceful degradation.
     makeRuntime:
       options.makeRuntime ??
-      (({ runtimePolicy: _runtimePolicy, ...input }) =>
+      (({ runtimePolicy: _runtimePolicy, currentRuntimePolicy, ...input }) =>
         makeMuseAcpRuntime({
           ...input,
           museSettings: options.settings,
-          environment: options.environment,
+          environment: museServeArgsForRuntimeMode(
+            currentRuntimePolicy.runtimeMode,
+            options.environment,
+          ),
           childProcessSpawner: options.childProcessSpawner,
         })),
     sessionModeForPolicy: (policy) => museApprovalModeForRuntimeMode(policy.runtimeMode),
+    runtimeRestartRequiredForPolicyChange: (previous, next) =>
+      museRuntimeRestartRequiredForPolicyChange(previous.runtimeMode, next.runtimeMode),
     promptFailure: (cause) =>
       makeProviderFailure({
         cause,

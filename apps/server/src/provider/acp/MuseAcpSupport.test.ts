@@ -9,6 +9,8 @@ import {
   museAcpRuntimeProcessOwnership,
   museAcpSpawnArgs,
   museApprovalModeForRuntimeMode,
+  museRuntimeRestartRequiredForPolicyChange,
+  museServeArgsForRuntimeMode,
   resolveMuseAcpBaseModelId,
   resolveMuseCliCommand,
 } from "./MuseAcpSupport.ts";
@@ -114,6 +116,43 @@ describe("isMuseSignInRequiredError", () => {
     ).toBe(false);
     expect(isMuseSignInRequiredError(new Error("Authentication required"))).toBe(false);
     expect(isMuseSignInRequiredError(null)).toBe(false);
+  });
+});
+
+describe("museServeArgsForRuntimeMode", () => {
+  it("passes no serve flags outside Full Access", () => {
+    const environment = { PATH: "/usr/bin" };
+    expect(museServeArgsForRuntimeMode("auto", environment)).toBe(environment);
+    expect(museServeArgsForRuntimeMode("approval-required", environment)).toBe(environment);
+    expect(museServeArgsForRuntimeMode("auto-accept-edits", environment)).toBe(environment);
+  });
+
+  it("disables the host sandbox for Full Access", () => {
+    expect(museServeArgsForRuntimeMode("full-access", {})).toEqual({
+      MUSE_SERVE_ARGS: "--disable-sandbox --trust-workspace",
+    });
+  });
+
+  it("appends to user-provided serve args without touching them", () => {
+    expect(museServeArgsForRuntimeMode("full-access", { MUSE_SERVE_ARGS: "--provider x" })).toEqual(
+      {
+        MUSE_SERVE_ARGS: "--provider x --disable-sandbox --trust-workspace",
+      },
+    );
+  });
+
+  it("lets an explicit user sandbox posture win over the automatic one", () => {
+    const environment = { MUSE_SERVE_ARGS: "--sandbox-network enabled" };
+    expect(museServeArgsForRuntimeMode("full-access", environment)).toBe(environment);
+  });
+});
+
+describe("museRuntimeRestartRequiredForPolicyChange", () => {
+  it("restarts only when crossing the sandbox boundary", () => {
+    expect(museRuntimeRestartRequiredForPolicyChange("auto", "full-access")).toBe(true);
+    expect(museRuntimeRestartRequiredForPolicyChange("full-access", "auto")).toBe(true);
+    expect(museRuntimeRestartRequiredForPolicyChange("auto", "approval-required")).toBe(false);
+    expect(museRuntimeRestartRequiredForPolicyChange("full-access", "full-access")).toBe(false);
   });
 });
 

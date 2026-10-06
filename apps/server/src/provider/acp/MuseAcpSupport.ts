@@ -88,6 +88,49 @@ export function museApprovalModeForRuntimeMode(runtimeMode: RuntimeMode): string
   }
 }
 
+export const MUSE_SERVE_ARGS_ENV = "MUSE_SERVE_ARGS";
+
+// Host-lifetime equivalent of the CLI's `--yolo` sandbox half for `muse serve`
+// (serve exposes no --yolo flag): no sandbox plus trusted workspace
+// skills/rules. Approval selection stays on the wire via the session mode.
+const MUSE_FULL_ACCESS_SERVE_ARGS = "--disable-sandbox --trust-workspace";
+
+/**
+ * Full Access runs the Muse host unsandboxed. Sandbox posture is fixed when
+ * the host spawns, so this merges the flags into the adapter spawn
+ * environment. An explicit user-provided sandbox posture always wins.
+ */
+export function museServeArgsForRuntimeMode(
+  runtimeMode: RuntimeMode,
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  if (museApprovalModeForRuntimeMode(runtimeMode) !== "allowAll") return environment;
+  const existing = environment[MUSE_SERVE_ARGS_ENV]?.trim() ?? "";
+  if (existing.toLowerCase().includes("sandbox")) return environment;
+  return {
+    ...environment,
+    [MUSE_SERVE_ARGS_ENV]: [existing, MUSE_FULL_ACCESS_SERVE_ARGS]
+      .filter((part) => part.length > 0)
+      .join(" "),
+  };
+}
+
+/** Whether the given runtime mode spawns the Muse host unsandboxed. */
+export function museSandboxDisabledForRuntimeMode(runtimeMode: RuntimeMode): boolean {
+  return museApprovalModeForRuntimeMode(runtimeMode) === "allowAll";
+}
+
+/** Whether crossing between two runtime modes changes the host sandbox posture. */
+export function museRuntimeRestartRequiredForPolicyChange(
+  previousRuntimeMode: RuntimeMode,
+  nextRuntimeMode: RuntimeMode,
+): boolean {
+  return (
+    museSandboxDisabledForRuntimeMode(previousRuntimeMode) !==
+    museSandboxDisabledForRuntimeMode(nextRuntimeMode)
+  );
+}
+
 export function museAcpRuntimeProcessOwnership(
   processGroupPlatform: NodeJS.Platform,
 ): Pick<
