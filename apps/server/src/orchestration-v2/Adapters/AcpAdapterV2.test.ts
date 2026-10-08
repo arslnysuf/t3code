@@ -12720,6 +12720,7 @@ describe("AcpAdapterV2", () => {
         return yield* fileSystem.readFileString(commandPidPath);
       }).pipe(Effect.timeoutOption("30 seconds"));
       if (Option.isNone(commandPidOption)) {
+        yield* Scope.close(sessionScope, Exit.void);
         assert.fail("mock agent must publish its Bash/sleep PIDs within 30 seconds");
       }
       const [commandRootPid, commandSleepPid] = commandPidOption.value
