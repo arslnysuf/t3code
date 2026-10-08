@@ -12466,6 +12466,9 @@ describe("AcpAdapterV2", () => {
 
   it.effect("Windows teardown is one-shot explicitly with independent finalizer cleanup", () =>
     Effect.gen(function* () {
+      // The scope finalizer branches on the real host platform, not the faked
+      // processGroupPlatform, so it taskkills again on Windows hosts.
+      const hostPlatform = yield* HostProcessPlatform;
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const path = yield* Path.Path;
       const mockAgentPath = yield* path.fromFileUrl(
@@ -12506,7 +12509,7 @@ describe("AcpAdapterV2", () => {
       });
       assert.equal(taskkillCommands.length, 1);
       yield* Scope.close(runtimeScope, Exit.void);
-      assert.equal(taskkillCommands.length, 1);
+      assert.equal(taskkillCommands.length, hostPlatform === "win32" ? 2 : 1);
     }).pipe(Effect.provide(layerTest)),
   );
 
@@ -12615,6 +12618,7 @@ describe("AcpAdapterV2", () => {
 
   it.live("poisons the session when hard teardown defects and blocks replacement work", () =>
     Effect.gen(function* () {
+      if ((yield* HostProcessPlatform) !== "linux") return;
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -12709,10 +12713,16 @@ describe("AcpAdapterV2", () => {
           makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal: 1 }),
         )
         .pipe(Effect.forkScoped);
-      while ((yield* fileSystem.readFileString(commandPidPath)).trim().length === 0) {
-        yield* Effect.yieldNow;
+      const commandPidOption = yield* Effect.gen(function* () {
+        while ((yield* fileSystem.readFileString(commandPidPath)).trim().length === 0) {
+          yield* Effect.yieldNow;
+        }
+        return yield* fileSystem.readFileString(commandPidPath);
+      }).pipe(Effect.timeoutOption("30 seconds"));
+      if (Option.isNone(commandPidOption)) {
+        assert.fail("mock agent must publish its Bash/sleep PIDs within 30 seconds");
       }
-      const [commandRootPid, commandSleepPid] = (yield* fileSystem.readFileString(commandPidPath))
+      const [commandRootPid, commandSleepPid] = commandPidOption.value
         .trim()
         .split(/\s+/)
         .map(Number);
